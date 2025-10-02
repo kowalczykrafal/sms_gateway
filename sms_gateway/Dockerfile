@@ -1,12 +1,12 @@
-ARG BUILD_FROM
+ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest
 FROM $BUILD_FROM
 
-ENV LANG C.UTF-8
+ENV LANG=C.UTF-8
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install requirements for add-on
 RUN apk add --no-cache python3 py3-pip python3-dev usbutils gcc musl-dev linux-headers
-RUN pip3 install --break-system-packages argparse pyserial requests paho-mqtt xmltodict
+RUN pip3 install --no-cache-dir argparse pyserial requests paho-mqtt xmltodict
 
 # Load USB modules for usbreset functionality
 RUN modprobe usb-storage || true
