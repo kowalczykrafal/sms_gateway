@@ -1,0 +1,70 @@
+name: "SMS Gateway"
+version: "1.0"
+stage: stable
+slug: "sms_gateway"
+description: "SMS Gateway for MQTT using a usb GSM dongle"
+codenotary: "rkowalik@o2.pl"
+url: "https://github.com/kowalczykrafal/sms_gateway"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+hassio_role: default
+hassio_api: false
+auth_api: false
+ingress: false
+init: false
+options:
+  GSM_Mode: "modem"
+  GSM_Device: "/dev/serial/by-id/usb-HUAWEI_HUAWEI_Mobile-if00-port0"
+  GSM_PIN: "0000"
+  MQTT_Host: "homeassistant.local"
+  MQTT_Port: "1883"
+  MQTT_User: "mqtt"
+  MQTT_Password: "mqtt"
+  MQTT_Receive: "sms_gateway/sms_received"
+  MQTT_Send: "sms_gateway/send_sms"
+  MQTT_Status: "sms_gateway/status"
+  MQTT_StartTime: "sms_gateway/start_time"
+  ADDON_Logging: "INFO"
+  Run_Diagnostics: false
+  # PIN functionality removed - not needed for modern modems
+schema:
+  GSM_Mode: str
+  GSM_Device: str
+  GSM_PIN: str
+  MQTT_Host: str
+  MQTT_Port: str
+  MQTT_User: str
+  MQTT_Password: password
+  MQTT_Receive: str
+  MQTT_Send: str
+  MQTT_Status: str
+  MQTT_StartTime: str
+  ADDON_Logging: str
+  Run_Diagnostics: bool
+  # PIN functionality removed - not needed for modern modems
+devices: 
+  - /dev/serial/by-id/usb-HUAWEI_Technology_HUAWEI_Mobile-if00-port0
+  - /dev/ttyUSB2
+  - /dev/ttyUSB3
+  - /dev/bus/usb/001/001
+  - /dev/bus/usb/001/002
+  - /dev/bus/usb/001/003
+device_cgroup_rules:
+  - 'c 188:* rmw'
+  - 'c 4:* rmw'
+  - 'c 189:* rmw'  # USB devices
+  - 'c 189:* rwm'  # USB devices with write access
+  - 'c 180:* rwm'  # USB character devices
+  - 'c 189:* rwm'  # USB block devices
+  - 'c 189:* rwm'  # USB serial devices
+  - 'c 189:* rwm'  # USB CDC devices
+  - 'c 189:* rwm'  # USB control devices
+  - 'c 189:* rwm'  # USB interface devices
+  - 'c 189:* rwm'  # USB endpoint devices
+  - 'c 189:* rwm'  # USB ioctl access
+  - 'c 189:* rwm'  # USB device control

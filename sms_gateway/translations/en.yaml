@@ -1,0 +1,71 @@
+---
+configuration:
+  GSM_Mode:
+    name: GSM Mode
+    description: >-
+      Select the GSM connection mode.
+      Use 'modem' for standard GSM modem operation.
+  GSM_Device:
+    name: GSM Device Path
+    description: >-
+      The device path to the GSM modem/dongle.
+      Usually points to the USB device path like /dev/serial/by-id/usb-HUAWEI_HUAWEI_Mobile-if00-port0.
+      Check available devices in the add-on logs if connection fails.
+  GSM_PIN:
+    name: GSM PIN Code
+    description: >-
+      The PIN code for your SIM card.
+      Enter the 4-digit PIN code (e.g., 0000) or leave as provided if no PIN is required.
+      Note: PIN functionality has been removed as it's not needed for modern modems.
+  MQTT_Host:
+    name: MQTT Broker Host
+    description: >-
+      The hostname or IP address of your MQTT broker.
+      Use 'homeassistant.local' for local Home Assistant MQTT broker or specify custom broker address.
+  MQTT_Port:
+    name: MQTT Broker Port
+    description: >-
+      The port number for MQTT broker connection.
+      Default is 1883 for non-encrypted connections, use 8883 for encrypted (TLS) connections.
+  MQTT_User:
+    name: MQTT Username
+    description: >-
+      Username for MQTT broker authentication.
+      Enter your MQTT broker username or leave as default if no authentication is required.
+  MQTT_Password:
+    name: MQTT Password
+    description: >-
+      Password for MQTT broker authentication.
+      Enter your MQTT broker password or leave as default if no authentication is required.
+  MQTT_Receive:
+    name: MQTT Receive Topic
+    description: >-
+      The MQTT topic where received SMS messages will be published.
+      Default is 'sms_gateway/sms_received'. Messages will be published to this topic when SMS is received.
+  MQTT_Send:
+    name: MQTT Send Topic
+    description: >-
+      The MQTT topic to subscribe to for sending SMS messages.
+      Default is 'sms_gateway/send_sms'. Publish messages to this topic to send SMS via the gateway.
+  MQTT_Status:
+    name: MQTT Status Topic
+    description: >-
+      The MQTT topic where gateway status information will be published.
+      Default is 'sms_gateway/status'. Status updates and connection state will be published here.
+  MQTT_StartTime:
+    name: MQTT Start Time Topic
+    description: >-
+      The MQTT topic where gateway start time will be published.
+      Default is 'sms_gateway/start_time'. The addon startup timestamp will be published to this topic.
+  ADDON_Logging:
+    name: Logging Level
+    description: >-
+      Set the logging level for the add-on.
+      Options: DEBUG (most verbose), INFO (default), WARNING, ERROR (least verbose).
+      Use DEBUG for troubleshooting, INFO for normal operation.
+  Run_Diagnostics:
+    name: Run Diagnostics
+    description: >-
+      Enable diagnostic mode for troubleshooting GSM connection issues.
+      When enabled, additional diagnostic information will be collected and logged.
+      Set to false for normal operation, true for debugging connectivity problems.

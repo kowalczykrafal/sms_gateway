@@ -1,0 +1,96 @@
+#include <tunables/global>
+
+profile sms_gateway flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Capabilities
+  file,
+  signal (send) set=(kill,term,int,hup,cont),
+
+  # Network access for MQTT connections
+  network,
+  capability net_raw,
+  capability net_admin,
+
+  # S6-Overlay
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/{,**} rwk,
+  /dev/tty rw,
+
+  # Bashio
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+
+  # Access to options.json and other files within your addon
+  /data/** rw,
+
+  # Python and script access
+  /usr/bin/python3 ix,
+  /usr/bin/python3.* ix,
+  /usr/lib/python3.*/** ix,
+  /sms_manager.py ix,
+  /sms_launcher.py ix,
+  /sms_mqtt_handler.py ix,
+  # /sms_status_manager.py removed - no longer needed
+  # /sms_diagnostics.py removed - no longer needed
+  # /gsm.py removed - no longer needed
+  /gsm_io.py ix,
+  /gsm_serial.py ix,
+  /gsm_io_thread.py ix,
+  /gsm_io_main.py ix,
+  # /gsm_text_decoder.py removed - no longer needed
+  /run.sh ix,
+
+  # Start new profile for service
+  /usr/bin/myprogram cx -> myprogram,
+
+  profile myprogram flags=(attach_disconnected,mediate_deleted) {
+    #include <abstractions/base>
+
+    # Network access for MQTT connections
+    network,
+    capability net_raw,
+    capability net_admin,
+
+    # Receive signals from S6-Overlay
+    signal (receive) peer=*_ADDON_SLUG,
+
+    # Access to options.json and other files within your addon
+    /data/** rw,
+
+    # Access to mapped volumes specified in config.json
+    /share/** rw,
+
+    # Access required for service functionality
+    /usr/bin/myprogram r,
+    /bin/bash rix,
+    /bin/echo ix,
+    /etc/passwd r,
+    /dev/tty rw,
+
+    # Python and script access
+    /usr/bin/python3 ix,
+    /usr/bin/python3.* ix,
+    /usr/lib/python3.*/** ix,
+    /sms_manager.py ix,
+    /sms_launcher.py ix,
+    /sms_mqtt_handler.py ix,
+    # /sms_status_manager.py removed - no longer needed
+    # /sms_diagnostics.py removed - no longer needed
+    # /gsm.py removed - no longer needed
+    /gsm_io.py ix,
+    /gsm_serial.py ix,
+    /gsm_io_thread.py ix,
+    /gsm_io_main.py ix,
+    # /gsm_text_decoder.py removed - no longer needed
+    /run.sh ix,
+  }
+}
