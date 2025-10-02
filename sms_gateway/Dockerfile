@@ -5,8 +5,7 @@ ENV LANG=C.UTF-8
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install requirements for add-on
-RUN apk add --no-cache python3 py3-pip python3-dev usbutils gcc musl-dev linux-headers
-RUN pip3 install --no-cache-dir argparse pyserial requests paho-mqtt xmltodict
+RUN apk add --no-cache python3 py3-pip python3-dev usbutils gcc musl-dev linux-headers py3-pyserial py3-requests py3-paho-mqtt
 
 # Load USB modules for usbreset functionality
 RUN modprobe usb-storage || true
