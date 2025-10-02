@@ -95,7 +95,14 @@ def on_message(client, userdata, msg, sms_gateway):
 
 def create_mqtt_client(host, port, user, password, sms_gateway):
     """Create and configure MQTT client"""
-    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    # Use compatible client creation for older paho-mqtt versions
+    try:
+        # Try new API first (paho-mqtt >= 2.0)
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    except AttributeError:
+        # Fallback to old API (paho-mqtt < 2.0)
+        mqtt_client = mqtt.Client()
+    
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message = lambda client, userdata, msg: on_message(client, userdata, msg, sms_gateway)
