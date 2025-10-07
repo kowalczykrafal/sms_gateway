@@ -223,7 +223,11 @@ class GSM(gsm_io):
                 
                 # Send AT+CMGL="ALL" command to get all SMS
                 frame = bytes(self.commands.ATCMGL + "\"ALL\"", 'ascii')
-                self.writeData(frame + b'\r')
+                try:
+                    self.writeData(frame + b'\r')
+                except ConnectionError as e:
+                    self.logger.error(f"❌ Connection error during startup SMS processing: {e}")
+                    raise e
                 
                 # Wait for response with timeout
                 timeout = 10  # 10 seconds timeout

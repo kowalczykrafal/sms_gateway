@@ -46,7 +46,11 @@ class GSMSMS:
                 self.gsm.GsmIoCMSSReceived = False
                 
                 # Send command and wait for prompt
-                self.gsm.writeData((sms_command + '\r').encode('ascii'))
+                try:
+                    self.gsm.writeData((sms_command + '\r').encode('ascii'))
+                except ConnectionError as e:
+                    self.logger.error(f"❌ Connection error during SMS send command: {e}")
+                    raise e
                 
                 # Wait for prompt
                 timeout = 0
@@ -59,7 +63,11 @@ class GSMSMS:
                 
                 # Send message
                 message_bytes = message.encode('utf-8')
-                self.gsm.writeData(message_bytes + b'\x1A')  # Ctrl+Z to send
+                try:
+                    self.gsm.writeData(message_bytes + b'\x1A')  # Ctrl+Z to send
+                except ConnectionError as e:
+                    self.logger.error(f"❌ Connection error during SMS message send: {e}")
+                    raise e
                 self.logger.debug(f"📤 SMS message sent: '{message}' + Ctrl+Z")
                 
                 # Wait for confirmation
@@ -183,8 +191,12 @@ class GSMSMS:
             
             self.logger.debug(f"📤 Executing AT command: SMS count check (AT+CPMS?)")
             
-            # Send CPMS command
-            self.gsm.writeData(b'AT+CPMS?\r\n')
+            # Send CPMS command with proper error handling
+            try:
+                self.gsm.writeData(b'AT+CPMS?\r\n')
+            except ConnectionError as e:
+                self.logger.error(f"❌ Connection error during SMS count check: {e}")
+                raise e  # Re-raise to be caught by readNewSms
             
             # Wait for CPMS response with timeout
             timeout = 10
@@ -232,7 +244,11 @@ class GSMSMS:
             
             # Send AT+CMGR command to read specific SMS
             frame = bytes(self.gsm.commands.ATCMGR + str(sms_id), 'ascii')
-            self.gsm.writeData(frame + b'\r')
+            try:
+                self.gsm.writeData(frame + b'\r')
+            except ConnectionError as e:
+                self.logger.error(f"❌ Connection error during SMS read: {e}")
+                raise e  # Re-raise to be caught by readNewSms
             
             # Wait for response with timeout
             timeout = 10  # 10 seconds timeout for single SMS read
@@ -331,7 +347,11 @@ class GSMSMS:
             self.logger.debug(f"🗑️ Sending delete command for SMS ID: {sms_id}")
             frame = bytes(self.gsm.commands.ATCMGD + str(sms_id) + ",0", 'ascii')
             # Use writeData directly instead of writeCommandAndWaitOK to avoid semaphore conflict
-            self.gsm.writeData(frame + b'\r')
+            try:
+                self.gsm.writeData(frame + b'\r')
+            except ConnectionError as e:
+                self.logger.error(f"❌ Connection error during SMS delete: {e}")
+                raise e  # Re-raise to be caught by readNewSms
             # Wait for OK response
             if not self.gsm.waitForGsmIoOKReceived(timeout=10):
                 raise Exception(f"Timeout waiting for OK response for SMS delete command")
