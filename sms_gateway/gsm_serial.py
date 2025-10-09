@@ -54,7 +54,10 @@ class GsmSerial:
                 if isinstance(data, str):
                     data = data.encode('ascii')
                 self.serial_connection.write(data)
+                # Enhanced logging for DEBUG mode
                 self.logger.debug(f"Data written to modem: {data.decode('ascii', errors='ignore')}")
+                self.logger.debug(f"Data written (hex): {data.hex()}")
+                self.logger.debug(f"Data written (bytes): {data}")
                 return True
         except Exception as e:
             self.logger.error(f"Error writing to modem: {e}")
@@ -75,6 +78,10 @@ class GsmSerial:
                 return b''
         except Exception as e:
             self.logger.error(f"Error reading from modem: {e}")
+            # If it's an I/O error, the modem connection is broken - raise exception
+            if "I/O error" in str(e) or "Errno 5" in str(e):
+                self.logger.error("❌ FATAL: Modem I/O error during read - connection lost. Raising exception.")
+                raise ConnectionError(f"Modem I/O error during read: {e}")
             return b''
     
     def has_data_available(self):
@@ -89,6 +96,10 @@ class GsmSerial:
             if current_time - self.last_error_log_time > 10:
                 self.logger.error(f"Error checking data availability: {e}")
                 self.last_error_log_time = current_time
+            # If it's an I/O error, the modem connection is broken - raise exception
+            if "I/O error" in str(e) or "Errno 5" in str(e):
+                self.logger.error("❌ FATAL: Modem I/O error during availability check - connection lost. Raising exception.")
+                raise ConnectionError(f"Modem I/O error during availability check: {e}")
             return False
     
     def flush_buffers(self):

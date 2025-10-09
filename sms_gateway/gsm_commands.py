@@ -48,9 +48,13 @@ class GSMCommands:
                 raise Exception("GSM device not opened")
             
             self.logger.debug(f"📤 Sending AT command: {description} ({command})")
+            self.logger.debug(f"📤 AT command details: command='{command}', timeout={timeout}s")
             
             # Use the existing writeCommandAndWaitOK mechanism from gsm_io
             frame = bytes(command, 'ascii')
+            self.logger.debug(f"📤 AT command frame: {frame}")
+            self.logger.debug(f"📤 AT command frame (hex): {frame.hex()}")
+            
             self.gsm.writeCommandAndWaitOK(frame, timeout=timeout)
             self.logger.debug(f"✅ AT command {description} completed successfully")
             return True
@@ -60,63 +64,41 @@ class GSMCommands:
             raise
     
     def _execute_at_command_safely(self, command, description="AT command", timeout=None, response_timeout=5):
-        """Execute AT command safely with synchronization to prevent collisions"""
-        if timeout is None:
-            timeout = self.gsm.AtCommandTimeout
-            
-        semaphore_acquired = False
+        """Execute AT command safely - assumes global semaphore is already acquired"""
         try:
-            # Acquire AT command semaphore
-            if not self.gsm.AtCommandSem.acquire(timeout=timeout):
-                self.logger.warning(f"⚠️ Timeout waiting for AT command semaphore for: {description}")
-                return False
-            
-            semaphore_acquired = True
-            
-            # Check if another AT command is already in progress
-            if self.gsm.AtCommandInProgress:
-                self.logger.warning(f"⚠️ AT command already in progress, skipping: {description}")
-                return False
-            
-            # Mark AT command as in progress
-            self.gsm.AtCommandInProgress = True
-            self.gsm.AtCommandStartTime = time.time()
-            self.logger.debug(f"🔒 AT command semaphore acquired for: {description}")
+            self.logger.debug(f"🔒 Executing AT command: {description}")
             
             # Execute the AT command using existing mechanism
-            try:
-                frame = bytes(command, 'ascii')
-                self.gsm.writeCommandAndWaitOK(frame, timeout=response_timeout)
+            # Note: Global semaphore should already be acquired by calling operation
+            frame = bytes(command, 'ascii')
+            result = self.gsm.writeCommandAndWaitOK(frame, timeout=response_timeout)
+            
+            if result:
                 self.logger.debug(f"✅ AT command {description} completed successfully")
-                return True
-            except Exception as e:
-                self.logger.warning(f"⚠️ AT command {description} failed: {e}")
-                return False
+            else:
+                self.logger.warning(f"⚠️ AT command {description} failed")
+            
+            return result
                 
         except Exception as e:
             self.logger.error(f"❌ Error executing AT command {description}: {e}")
             return False
-        finally:
-            # Always reset flag
-            self.gsm.AtCommandInProgress = False
-            self.gsm.AtCommandStartTime = None
-            
-            # Only release semaphore if it was acquired
-            if semaphore_acquired:
-                self.gsm.AtCommandSem.release()
-                self.logger.debug(f"🔓 AT command semaphore released for: {description}")
     
     def _check_at_command_hang(self):
         """Check if AT command is hung and force reset if necessary"""
         try:
-            if self.gsm.AtCommandInProgress and self.gsm.AtCommandStartTime:
-                elapsed_time = time.time() - self.gsm.AtCommandStartTime
-                if elapsed_time > self.gsm.AtCommandMaxDuration:
-                    self.logger.warning(f"⚠️ AT command hung for {elapsed_time:.1f}s - forcing reset")
+            # Check if modem operation is hung using new global semaphore system
+            if (self.gsm.ModemOperationInProgress and 
+                self.gsm.ModemOperationStartTime and 
+                self.gsm.ModemOperationType):
+                elapsed_time = time.time() - self.gsm.ModemOperationStartTime
+                if elapsed_time > self.gsm.ModemOperationTimeout:
+                    self.logger.warning(f"⚠️ Modem operation {self.gsm.ModemOperationType} hung for {elapsed_time:.1f}s - forcing reset")
                     
-                    # Force reset AT command state
-                    self.gsm.AtCommandInProgress = False
-                    self.gsm.AtCommandStartTime = None
+                    # Force reset modem operation state
+                    self.gsm.ModemOperationInProgress = False
+                    self.gsm.ModemOperationType = None
+                    self.gsm.ModemOperationStartTime = None
                     
                     # Try to clear any pending data
                     if hasattr(self.gsm, 'GsmSerial') and self.gsm.GsmSerial:

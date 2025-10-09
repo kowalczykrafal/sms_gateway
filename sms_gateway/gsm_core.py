@@ -53,16 +53,14 @@ class GSM(gsm_io):
         
         # Threading and synchronization
         self.GsmReaderThread = None
-        self.GsmApiSem = Lock()
-        self.GsmMutex = Lock()
         self.SMSQueue = Queue()
         
-        # AT command synchronization
-        self.AtCommandSem = Lock()
-        self.AtCommandInProgress = False
-        self.AtCommandTimeout = 30
-        self.AtCommandStartTime = None
-        self.AtCommandMaxDuration = 10
+        # Global modem communication semaphore - only one operation at a time
+        self.ModemSemaphore = Lock()
+        self.ModemOperationInProgress = False
+        self.ModemOperationType = None  # 'startup', 'sms_receive', 'status_check', 'sms_send'
+        self.ModemOperationStartTime = None
+        self.ModemOperationTimeout = 120  # 2 minutes max per operation
         
         # State flags (inherited from gsm_io, but set defaults)
         self.Opened = False
@@ -77,6 +75,74 @@ class GSM(gsm_io):
         self.sms = GSMSMS(self)
         self.reset = GSMReset(self)
         self.diagnostics = GSMDiagnostics(self)
+    
+    def acquire_modem_semaphore(self, operation_type, timeout=None):
+        """Acquire global modem semaphore for specific operation"""
+        if timeout is None:
+            timeout = self.ModemOperationTimeout
+            
+        try:
+            if not self.ModemSemaphore.acquire(timeout=timeout):
+                self.logger.warning(f"⚠️ Timeout waiting for modem semaphore for {operation_type} operation")
+                return False
+            
+            # Check if another operation is already in progress
+            if self.ModemOperationInProgress:
+                self.logger.warning(f"⚠️ Modem operation {self.ModemOperationType} already in progress, skipping {operation_type}")
+                self.ModemSemaphore.release()
+                return False
+            
+            # Mark operation as in progress
+            self.ModemOperationInProgress = True
+            self.ModemOperationType = operation_type
+            self.ModemOperationStartTime = time.time()
+            
+            # Start I/O thread when semaphore is acquired
+            if hasattr(self, 'gsm_io_main') and hasattr(self.gsm_io_main, 'io_thread'):
+                if not self.gsm_io_main.io_thread.is_running:
+                    self.logger.debug("🔄 Starting I/O thread for modem communication")
+                    self.gsm_io_main.io_thread.start()
+            
+            self.logger.debug(f"🔒 Modem semaphore acquired for {operation_type} operation")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error acquiring modem semaphore for {operation_type}: {e}")
+            return False
+    
+    def release_modem_semaphore(self, operation_type):
+        """Release global modem semaphore after operation completion"""
+        try:
+            if self.ModemOperationInProgress and self.ModemOperationType == operation_type:
+                elapsed = time.time() - self.ModemOperationStartTime
+                self.logger.debug(f"🔓 Modem semaphore released for {operation_type} operation (took {elapsed:.1f}s)")
+                
+                # Stop I/O thread when semaphore is released
+                if hasattr(self, 'gsm_io_main') and hasattr(self.gsm_io_main, 'io_thread'):
+                    if self.gsm_io_main.io_thread.is_running:
+                        self.logger.debug("🔄 Stopping I/O thread - no modem operations in progress")
+                        self.gsm_io_main.io_thread.stop()
+                
+                self.ModemOperationInProgress = False
+                self.ModemOperationType = None
+                self.ModemOperationStartTime = None
+                self.ModemSemaphore.release()
+                return True
+            else:
+                self.logger.warning(f"⚠️ Attempted to release semaphore for {operation_type} but operation is {self.ModemOperationType}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error releasing modem semaphore for {operation_type}: {e}")
+            return False
+    
+    def is_modem_busy(self):
+        """Check if modem is currently busy with an operation"""
+        return self.ModemOperationInProgress
+    
+    def get_current_operation(self):
+        """Get current modem operation type"""
+        return self.ModemOperationType if self.ModemOperationInProgress else None
     
     def __del__(self):
         """Destructor - ensure cleanup"""
@@ -103,11 +169,15 @@ class GSM(gsm_io):
             # Start I/O activity
             self.startGsmIoActivity()
             
-            # Initialize device
-            self.initGsmDevice()
-            
-            # Process startup SMS
-            self.processStartupSms()
+            # Initialize device with semaphore
+            if self.acquire_modem_semaphore("startup", timeout=180):
+                try:
+                    self.initGsmDevice()
+                    self.processStartupSms()
+                finally:
+                    self.release_modem_semaphore("startup")
+            else:
+                raise Exception("Failed to acquire modem semaphore for startup")
             
             # Start SMS reader thread
             self.startGsmReader()
@@ -196,8 +266,8 @@ class GSM(gsm_io):
                 # Wait a bit for modem to be fully ready
                 time.sleep(2)
                 
-                self.commands.send_command("AT+CPMS=\"SM\",\"SM\",\"SM\"", "Set SMS storage to SIM", timeout=15)
-                self.logger.info("✅ SMS storage set successfully")
+                self.commands.send_command("AT+CPMS?", "Check SMS storage status", timeout=30)
+                self.logger.info("✅ SMS storage status checked successfully")
             except Exception as e:
                 # Log timeout errors as warnings, others as errors
                 if "Timeout" in str(e):
@@ -216,39 +286,57 @@ class GSM(gsm_io):
         try:
             self.logger.info("📱 Processing startup SMS messages...")
             
-            with self.GsmApiSem:
-                # Check for existing SMS messages using the same mechanism as readNewSms
-                self.SmsList = []
-                self.GsmIoCMGLReceived = False
+            # Check for existing SMS messages using the same mechanism as readNewSms
+            # Note: Global semaphore should already be acquired by calling operation
+            self.SmsList = []
+            self.GsmIoCMGLReceived = False
+            
+            # Send AT+CMGL="ALL" command to get all SMS
+            # Set flag to expect CMGL response
+            if hasattr(self, 'gsm_io_main') and hasattr(self.gsm_io_main, 'io_thread'):
+                self.gsm_io_main.io_thread.set_expecting_cmgl(True)
+            
+            frame = bytes(self.commands.ATCMGL + "\"ALL\"", 'ascii')
+            self.writeData(frame + b'\r')
+            
+            # Wait for response with timeout
+            timeout = 10  # 10 seconds timeout
+            start_time = time.time()
+            while not self.GsmIoCMGLReceived and (time.time() - start_time) < timeout:
+                time.sleep(0.1)
+            
+            sms_list = self.SmsList if self.GsmIoCMGLReceived else []
+            
+            # Also check if we have CMGL data from the new I/O thread
+            if not sms_list and hasattr(self, 'gsm_io_main') and self.gsm_io_main.io_thread.cmgl_received:
+                cmgl_data = self.gsm_io_main.io_thread.cmgl_data
+                if cmgl_data:
+                    self.logger.info(f"📨 Found CMGL data: {cmgl_data}")
+                    # Parse CMGL response manually
+                    sms_list = self._parse_cmgl_response(cmgl_data)
+                    # Reset CMGL flags after processing
+                    self.gsm_io_main.io_thread.cmgl_received = False
+                    self.gsm_io_main.io_thread.cmgl_data = ""
+            
+            if sms_list:
+                self.logger.info(f"📨 Found {len(sms_list)} existing SMS message(s) in inbox")
                 
-                # Send AT+CMGL="ALL" command to get all SMS
-                frame = bytes(self.commands.ATCMGL + "\"ALL\"", 'ascii')
-                self.writeData(frame + b'\r')
+                # Clear only READ messages, preserve UNREAD
+                read_messages = [sms for sms in sms_list if sms['Status'] == 'REC READ']
+                unread_messages = [sms for sms in sms_list if sms['Status'] == 'REC UNREAD']
                 
-                # Wait for response with timeout
-                timeout = 10  # 10 seconds timeout
-                start_time = time.time()
-                while not self.GsmIoCMGLReceived and (time.time() - start_time) < timeout:
-                    time.sleep(0.1)
-                
-                sms_list = self.SmsList if self.GsmIoCMGLReceived else []
-                
-                if sms_list:
-                    self.logger.info(f"📨 Found {len(sms_list)} existing SMS message(s) in inbox")
-                    
-                    # Clear only READ messages, preserve UNREAD
-                    read_messages = [sms for sms in sms_list if sms['Status'] == 'REC READ']
-                    unread_messages = [sms for sms in sms_list if sms['Status'] == 'REC UNREAD']
-                    
-                    if read_messages:
-                        self.logger.info(f"🗑️ Clearing {len(read_messages)} READ message(s) at startup")
-                        for sms in read_messages:
-                            self.sms.delete_sms(sms['Id'])
+                if read_messages:
+                    self.logger.info(f"🗑️ Clearing {len(read_messages)} READ message(s) at startup")
+                    for sms in read_messages:
+                        self.logger.info(f"🗑️ Deleting READ SMS ID: {sms['Id']}")
+                        self.sms.delete_sms(sms['Id'])
                     
                     if unread_messages:
                         self.logger.info(f"📱 Preserving {len(unread_messages)} UNREAD message(s) for processing")
                 else:
-                    self.logger.debug("📭 No existing SMS messages found in inbox")
+                    self.logger.debug("📭 No READ messages found to clear")
+            else:
+                self.logger.debug("📭 No existing SMS messages found in inbox")
             
             self.logger.info("📱 Startup SMS processing completed")
             
@@ -276,6 +364,45 @@ class GSM(gsm_io):
                     
             except Exception as restart_error:
                 self.logger.error(f"❌ Error during modem restart: {restart_error}")
+    
+    def _parse_cmgl_response(self, cmgl_data):
+        """Parse CMGL response data into SMS list"""
+        try:
+            sms_list = []
+            lines = cmgl_data.split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                if line.startswith('+CMGL:'):
+                    # Parse CMGL line: +CMGL: 5,"REC READ","+48509073123",,"25/10/07,18:52:14+08",145
+                    parts = line.split(',')
+                    if len(parts) >= 6:
+                        try:
+                            sms_id = parts[0].split(':')[1].strip()
+                            status = parts[1].strip().strip('"')
+                            number = parts[2].strip().strip('"')
+                            # Skip parts[3] (empty)
+                            timestamp = parts[4].strip().strip('"')
+                            # Skip parts[5] (length)
+                            
+                            sms_data = {
+                                'Id': sms_id,
+                                'Status': status,
+                                'Number': number,
+                                'Timestamp': timestamp,
+                                'Msg': ''  # No message content in CMGL
+                            }
+                            sms_list.append(sms_data)
+                            self.logger.debug(f"📨 Parsed SMS: ID={sms_id}, Status={status}, Number={number}")
+                        except (ValueError, IndexError) as e:
+                            self.logger.warning(f"⚠️ Error parsing CMGL line: {line} - {e}")
+                            continue
+            
+            return sms_list
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error parsing CMGL response: {e}")
+            return []
     
     def startGsmReader(self):
         """Start SMS reader thread"""
@@ -347,16 +474,28 @@ class GSM(gsm_io):
                 error_str = str(e).lower()
                 if "hang" in error_str or "not responsive" in error_str or "timeout" in error_str:
                     self.logger.critical(f"💀 Modem hang/responsiveness error detected: {e}")
-                    self.logger.critical("🔄 Stopping SMS reader thread - main loop will exit program")
+                    self.logger.critical("🔄 Stopping I/O thread and SMS reader thread - main loop will exit program")
                     self.logger.critical("💡 This will allow system restart (Docker/Home Assistant will restart the container)")
+                    
+                    # Stop I/O thread first
+                    if hasattr(self, 'gsm_io_main') and hasattr(self.gsm_io_main, 'io_thread'):
+                        self.logger.critical("🔄 Stopping I/O thread...")
+                        self.gsm_io_main.stop()
+                    
                     self.GsmReaderThread.isRunning = False
                     break
                 
                 # Check if it's a connection error - stop thread and let main loop handle exit
                 elif self.reset._is_connection_error(e):
                     self.logger.critical(f"💀 I/O error detected: {e}")
-                    self.logger.critical("🔄 Stopping SMS reader thread - main loop will exit program")
+                    self.logger.critical("🔄 Stopping I/O thread and SMS reader thread - main loop will exit program")
                     self.logger.critical("💡 This will allow system restart (Docker/Home Assistant will restart the container)")
+                    
+                    # Stop I/O thread first
+                    if hasattr(self, 'gsm_io_main') and hasattr(self.gsm_io_main, 'io_thread'):
+                        self.logger.critical("🔄 Stopping I/O thread...")
+                        self.gsm_io_main.stop()
+                    
                     self.GsmReaderThread.isRunning = False
                     break
                 else:

@@ -24,11 +24,13 @@ class GsmIoThread:
         self.cpms_received = False
         self.cmgr_received = False
         self.cmgl_received = False
+        self.csq_received = False
         
         # Response data
         self.cpms_data = ""
         self.cmgr_data = ""
         self.cmgl_data = ""
+        self.csq_data = ""
         
         # Frame buffer
         self.frame_buffer = b''
@@ -40,6 +42,15 @@ class GsmIoThread:
         self.last_response = ""
         self.response_count = 0
         self.max_duplicate_responses = 10
+        
+        # Command expectation flags
+        self._expecting_cmgl = False
+    
+    def set_expecting_cmgl(self, expecting=True):
+        """Set flag indicating we're expecting a CMGL response"""
+        self._expecting_cmgl = expecting
+        if expecting:
+            self.logger.debug("📨 Set expecting CMGL response flag")
         
     def start(self):
         """Start the I/O thread"""
@@ -81,6 +92,12 @@ class GsmIoThread:
                     
                 except Exception as e:
                     self.logger.error(f"Error in GSM I/O thread: {e}")
+                    # Check if it's a connection error - if so, exit the thread
+                    if hasattr(self.gsm, 'reset') and self.gsm.reset._is_connection_error(e):
+                        self.logger.critical("💀 Connection error in I/O thread - exiting thread")
+                        self.logger.critical("🔄 Main thread will handle the connection error")
+                        self.stop()  # Stop the I/O thread properly
+                        break
                     time.sleep(1)
                     continue
                     
@@ -93,12 +110,16 @@ class GsmIoThread:
     def _process_available_data(self):
         """Process data available from modem"""
         if self.serial.has_data_available():
-            data = self.serial.read_data(64)
+            # Read more data at once to get complete responses
+            data = self.serial.read_data(256)
             
             if data:
                 try:
                     data_str = data.decode('ascii', errors='ignore')
-                    # Data logging removed to reduce spam
+                    # Log raw data in DEBUG mode
+                    self.logger.debug(f"📥 Raw data received: {data}")
+                    self.logger.debug(f"📥 Raw data (hex): {data.hex()}")
+                    self.logger.debug(f"📥 Raw data (decoded): {data_str}")
                 except Exception as e:
                     self.logger.error(f"❌ Error decoding data: {e}")
                 
@@ -127,9 +148,12 @@ class GsmIoThread:
         if '\r\n' in frame_str:
             # Complete response received
             response_text = frame_str.strip()
-            # Only log important responses, not every frame
-            if any(keyword in response_text for keyword in ['+CMGL:', '+CMGS:', '+CMSS:', '+CMTI:', '+CMGR:', 'ERROR']):
-                self.logger.debug(f"📥 Modem response: {response_text}")
+            # Log ALL modem responses in DEBUG mode
+            self.logger.debug(f"📥 Modem response: {response_text}")
+            
+            # Also log important responses with special markers
+            if any(keyword in response_text for keyword in ['+CMGL:', '+CMGS:', '+CMSS:', '+CMTI:', '+CMGR:', '+CPMS:', '+CSQ:', 'ERROR']):
+                self.logger.debug(f"🔍 Important response: {response_text}")
             
             # Process command responses
             if '+CMGR:' in response_text:
@@ -139,6 +163,17 @@ class GsmIoThread:
                 # Reset loop protection for new SMS read
                 self.last_response = ""
                 self.response_count = 0
+                
+                # Check if this is a complete CMGR response with SMS content and OK
+                if '+CMGR:' in response_text and 'OK' in response_text and '\n' in response_text:
+                    # This is a complete CMGR response with SMS content and OK
+                    self.cmgr_received = True
+                    self.cmgr_data = response_text
+                    self.logger.debug(f"📨 Complete CMGR response detected with SMS content and OK")
+                    self.logger.debug(f"📨 SMS READ COMPLETED: {response_text}")
+                    # Clear frame buffer to prevent reprocessing
+                    self.frame_buffer = b''
+                    return  # Don't process as regular response
             elif self.cmgr_data and not self.cmgr_received and not any(keyword in response_text for keyword in ['+CMGR:', 'ERROR']):
                 # This is SMS content between +CMGR: and final OK
                 # Check for infinite loop protection FIRST
@@ -181,7 +216,14 @@ class GsmIoThread:
             self.frame_buffer = b''
             
         elif len(self.frame_buffer) > 0:
-            # Partial frame - only log if it's getting too long
+            # Partial frame - check if it's a CMGR response that needs to be completed
+            frame_str = self.frame_buffer.decode('ascii', errors='ignore')
+            if '+CMGR:' in frame_str and not self.cmgr_received:
+                # This is a partial CMGR response - keep collecting
+                self.logger.debug(f"📨 Collecting partial CMGR response: {frame_str}")
+                return  # Don't clear buffer, keep collecting
+            
+            # Only log if it's getting too long
             if len(self.frame_buffer) > 100:
                 self.logger.warning(f"⚠️ Frame getting long ({len(self.frame_buffer)} bytes), clearing buffer")
                 self.frame_buffer = b''
@@ -192,6 +234,21 @@ class GsmIoThread:
         if '+CPMS:' in response_text:
             self.cpms_received = True
             self.cpms_data = response_text
+            self.logger.debug(f"📊 CPMS response received: {response_text}")
+            
+            # If this response also contains OK, we have a complete response
+            if 'OK' in response_text:
+                self.ok_received = True
+                self.logger.debug(f"📊 CPMS response with OK - complete response received")
+        elif '+CSQ:' in response_text:
+            self.csq_received = True
+            self.csq_data = response_text
+            self.logger.debug(f"📶 Signal strength response: {response_text}")
+            
+            # If this response also contains OK, we have a complete response
+            if 'OK' in response_text:
+                self.ok_received = True
+                self.logger.debug(f"📶 CSQ response with OK - complete response received")
         elif '+CMGS:' in response_text:
             self.cmss_received = True
             self.logger.info(f"✅ SMS sent: {response_text}")
@@ -200,6 +257,17 @@ class GsmIoThread:
             self.logger.info(f"✅ SMS sent: {response_text}")
         elif '+CMTI:' in response_text:
             self.cmti_received = True
+        elif '+CMGL:' in response_text:
+            # CMGL response - mark as received
+            self.cmgl_received = True
+            self.cmgl_data = response_text
+            self.logger.debug(f"📨 CMGL response received: {response_text}")
+            
+            # Check if this is a complete CMGL response with SMS content and OK
+            if '+CMGL:' in response_text and 'OK' in response_text and '\n' in response_text:
+                # This is a complete CMGL response with SMS content and OK
+                self.logger.debug(f"📨 Complete CMGL response detected with SMS content and OK")
+                self.logger.debug(f"📨 CMGL READ COMPLETED: {response_text}")
         elif '+CME ERROR' in response_text:
             self.logger.warning(f"⚠️ CME ERROR: {response_text}")
         elif 'ERROR' in response_text or 'ERROR\r\n' in frame_str:
@@ -218,18 +286,32 @@ class GsmIoThread:
                 # Keep cmgr_data for parsing, don't reset it yet
             
             # If we got OK without CMGL, it means no SMS (old logic - just log for debugging)
-            if not self.cmgl_received and not self.sms_list:
+            # Only log this if we're actually expecting a CMGL response (not for every OK)
+            if not self.cmgl_received and not self.sms_list and hasattr(self, '_expecting_cmgl') and self._expecting_cmgl:
                 self.cmgl_received = True
-                self.logger.debug("📨 No SMS found - CMGL response completed")
+                # Only log if this is a standalone OK (not part of a larger response)
+                if response_text.strip() == 'OK':
+                    self.logger.debug("📨 No SMS found - CMGL response completed")
+                self._expecting_cmgl = False  # Reset flag
         elif '+CMGR:' in response_text:
             # Start collecting CMGR response
             self.cmgr_received = False  # Don't set to True yet, wait for complete response
             self.cmgr_data = response_text
             self.logger.debug(f"📨 Started CMGR response: {response_text}")
             self.logger.debug(f"📨 SMS READ STARTED: {response_text}")
-        elif '+CMGL:' in response_text:
-            # CMGL response (old logic - just log for debugging)
-            self.logger.debug(f"📨 CMGL response received: {response_text}")
+            
+            # Check if this is a complete CMGR response (contains all fields)
+            # Format: +CMGR: "REC READ","+48509073123",,"25/10/08,09:58:46+08",145,3
+            if response_text.count(',') >= 5:  # Complete CMGR header
+                self.logger.debug(f"📨 Complete CMGR header detected: {response_text}")
+                # Don't set cmgr_received yet, wait for SMS content and final OK
+                
+            # Check if this response contains both CMGR header and OK (complete response)
+            if '+CMGR:' in response_text and 'OK' in response_text and '\n' in response_text:
+                # This is a complete CMGR response with SMS content and OK
+                self.cmgr_received = True
+                self.logger.debug(f"📨 Complete CMGR response detected with SMS content and OK")
+                self.logger.debug(f"📨 SMS READ COMPLETED: {response_text}")
         elif '+CMGS:' in response_text:
             self.cmss_received = True
             self.logger.info(f"✅ SMS sent: {response_text}")
@@ -247,9 +329,11 @@ class GsmIoThread:
         self.cpms_received = False
         self.cmgr_received = False
         self.cmgl_received = False
+        self.csq_received = False
         self.cpms_data = ""
         self.cmgr_data = ""
         self.cmgl_data = ""
+        self.csq_data = ""
         self.frame_buffer = b''
         
         # Reset SMS parsing state

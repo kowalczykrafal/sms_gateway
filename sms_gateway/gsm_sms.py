@@ -25,15 +25,12 @@ class GSMSMS:
             if not self.gsm.Opened:
                 raise Exception("GSM device not opened")
             
-            # Check if AT command semaphore is available
-            if not self.gsm.AtCommandSem.acquire(blocking=False):
-                self.logger.warning("⚠️ AT command semaphore busy - waiting for SMS send...")
-                # Wait for semaphore with timeout (2 minutes)
-                if not self.gsm.AtCommandSem.acquire(blocking=True, timeout=120):
-                    raise Exception("Timeout waiting for AT command semaphore (2 minutes)")
+            # Acquire global modem semaphore for SMS sending operation
+            if not self.gsm.acquire_modem_semaphore("sms_send", timeout=120):
+                raise Exception("Timeout waiting for modem semaphore (2 minutes)")
             
             try:
-                self.logger.debug("🔒 AT command semaphore acquired for SMS sending")
+                self.logger.debug("🔒 Modem semaphore acquired for SMS sending")
                 # Set text mode
                 self.gsm.commands.send_command("AT+CMGF=1", "Set text mode")
                 
@@ -77,9 +74,8 @@ class GSMSMS:
                     raise Exception("Timeout waiting for SMS confirmation")
                     
             finally:
-                # Always release AT command semaphore
-                self.gsm.AtCommandSem.release()
-                self.logger.debug("🔓 AT command semaphore released after SMS sending")
+                # Always release global modem semaphore
+                self.gsm.release_modem_semaphore("sms_send")
                     
         except Exception as e:
             self.logger.error(f"❌ Failed to send SMS to {number}: {e}")
@@ -94,39 +90,29 @@ class GSMSMS:
                 
             self.logger.debug("📱 Checking for new SMS messages...")
             
-            # Check if AT command semaphore is available before SMS operations
-            if not self.gsm.AtCommandSem.acquire(blocking=False):
-                self.logger.warning("⚠️ AT command semaphore busy - skipping SMS check")
+            # Acquire global modem semaphore for SMS receiving operation
+            # Increased timeout to 120 seconds to handle large SMS volumes
+            if not self.gsm.acquire_modem_semaphore("sms_receive", timeout=120):
+                self.logger.warning("⚠️ Modem semaphore busy - skipping SMS check")
                 return None
             
             try:
-                # First check if there are any SMS messages
-                self.logger.debug("🔄 Checking SMS message count...")
-                sms_count = self._check_sms_count()
+                # Record start time for SMS processing
+                sms_processing_start = time.time()
+                self.logger.debug("🔄 Starting SMS processing...")
                 
-                if sms_count == 0:
+                # Get actual SMS list using CMGL to get real SMS IDs
+                self.logger.debug("🔄 Getting SMS list with actual IDs...")
+                sms_list = self._get_sms_list()
+                
+                if not sms_list:
                     self.logger.info("📭 No SMS messages found in modem")
                     return None
-                elif sms_count is None:
-                    # SMS count check couldn't determine count - try to read SMS directly
-                    self.logger.info("📊 SMS count check couldn't determine count - trying to read SMS directly...")
-                    sms_count = 1  # Assume there might be SMS and try to read
-                else:
-                    self.logger.debug(f"📨 Found {sms_count} SMS message(s) - reading details...")
                 
-                # Process SMS iteratively - read and process one by one
-                self.logger.debug(f"📨 Found {sms_count} SMS message(s) - processing iteratively")
+                self.logger.debug(f"📨 Found {len(sms_list)} SMS message(s) - processing with real IDs")
                 
-                # Process each SMS iteratively
-                for sms_id in range(sms_count):
-                    self.logger.debug(f"📩 Processing SMS ID: {sms_id}")
-                    
-                    # Read individual SMS using AT+CMGR
-                    sms_data = self._read_single_sms(sms_id)
-                    if not sms_data:
-                        self.logger.warning(f"⚠️ Failed to read SMS ID: {sms_id}")
-                        continue
-                    
+                # Process each SMS using real IDs from CMGL
+                for sms_data in sms_list:
                     message_id = sms_data['Id']
                     number = sms_data['Number']
                     status = sms_data['Status']
@@ -144,14 +130,23 @@ class GSMSMS:
                         self.logger.debug(f"🗑️ Attempting to delete SMS ID: {message_id}")
                         self._delete_sms_without_semaphore(message_id)
                         self.logger.debug(f"🗑️ Successfully deleted SMS ID: {message_id}")
+                        # Small delay to allow modem to process the deletion
+                        time.sleep(0.5)
                     except Exception as e:
                         self.logger.warning(f"⚠️ Failed to delete SMS ID {message_id}: {e}")
+                
+                # Log SMS processing time
+                sms_processing_time = time.time() - sms_processing_start
+                if sms_processing_time > 60:
+                    self.logger.warning(f"⚠️ SMS processing took {sms_processing_time:.1f} seconds - consider optimizing")
+                else:
+                    self.logger.info(f"📊 SMS processing completed in {sms_processing_time:.1f} seconds")
                 
                 return None  # SMS are processed in runGsmReaderThread
                 
             finally:
-                # Always release AT command semaphore AFTER all SMS processing is complete
-                self.gsm.AtCommandSem.release()
+                # Always release global modem semaphore AFTER all SMS processing is complete
+                self.gsm.release_modem_semaphore("sms_receive")
             
         except Exception as e:
             self.logger.error(f"❌ Error in readNewSms: {e}")
@@ -171,6 +166,115 @@ class GSMSMS:
             if hang_error:
                 raise hang_error
     
+    def _get_sms_list(self):
+        """Get list of SMS messages with their actual IDs using AT+CMGL"""
+        try:
+            self.logger.debug("🔄 Getting SMS list with AT+CMGL...")
+            
+            # Reset CMGL flags
+            self.gsm.GsmIoCMGLReceived = False
+            self.gsm.GsmIoCMGLData = ""
+            if hasattr(self.gsm, 'gsm_io_main') and hasattr(self.gsm.gsm_io_main, 'io_thread'):
+                self.gsm.gsm_io_main.io_thread.cmgl_received = False
+                self.gsm.gsm_io_main.io_thread.cmgl_data = ""
+                self.gsm.gsm_io_main.io_thread.set_expecting_cmgl(True)
+            
+            # Send AT+CMGL command to list all SMS
+            frame = bytes(self.gsm.commands.ATCMGL + "\"ALL\"", 'ascii')
+            cmgl_cmd = frame + b'\r'
+            self.logger.debug(f"📤 Sending CMGL command: {cmgl_cmd}")
+            self.gsm.writeData(frame + b'\r')
+            
+            # Wait for response with timeout
+            timeout = 30
+            if not self.gsm.waitForGsmIoCMGLReceived(timeout):
+                self.logger.warning(f"⚠️ Timeout waiting for CMGL response after {timeout}s")
+                return []
+            
+            # Get CMGL data from new I/O thread location first, fallback to old location
+            cmgl_data = None
+            if hasattr(self.gsm, 'gsm_io_main') and hasattr(self.gsm.gsm_io_main, 'io_thread'):
+                if self.gsm.gsm_io_main.io_thread.cmgl_data:
+                    cmgl_data = self.gsm.gsm_io_main.io_thread.cmgl_data
+                    self.logger.debug(f"📨 Using new CMGL data: {cmgl_data}")
+            
+            if not cmgl_data and hasattr(self.gsm, 'GsmIoCMGLData') and self.gsm.GsmIoCMGLData:
+                cmgl_data = self.gsm.GsmIoCMGLData
+                self.logger.debug(f"📨 Using old CMGL data: {cmgl_data}")
+            
+            # Check if CMGL response was received but no data (means no SMS)
+            if not cmgl_data:
+                # Check if CMGL response was received (indicates successful command execution)
+                cmgl_received = False
+                if hasattr(self.gsm, 'gsm_io_main') and hasattr(self.gsm.gsm_io_main, 'io_thread'):
+                    cmgl_received = self.gsm.gsm_io_main.io_thread.cmgl_received
+                elif hasattr(self.gsm, 'GsmIoCMGLReceived'):
+                    cmgl_received = self.gsm.GsmIoCMGLReceived
+                
+                if cmgl_received:
+                    self.logger.debug("📨 CMGL response received but no data - no SMS found")
+                    return []  # No SMS found
+                else:
+                    self.logger.warning("⚠️ No CMGL response received")
+                    return []
+            
+            # Parse CMGL response into SMS list
+            sms_list = self._parse_cmgl_response(cmgl_data)
+            self.logger.debug(f"📨 Parsed {len(sms_list)} SMS from CMGL response")
+            
+            return sms_list
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error getting SMS list: {e}")
+            # Check if it's a connection error and propagate it
+            if self.gsm.reset._is_connection_error(e):
+                self.logger.warning("🔄 Connection error in SMS list - propagating to main thread")
+                raise e
+            return []
+    
+    def _parse_cmgl_response(self, cmgl_data):
+        """Parse CMGL response data into SMS list"""
+        try:
+            sms_list = []
+            lines = cmgl_data.split('\n')
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if line.startswith('+CMGL:'):
+                    # Parse CMGL line: +CMGL: 0,"REC READ","+48509073123",,"25/10/08,13:10:00+08",145,2
+                    parts = line.split(',')
+                    if len(parts) >= 6:
+                        try:
+                            sms_id = parts[0].split(':')[1].strip()
+                            status = parts[1].strip().strip('"')
+                            number = parts[2].strip().strip('"')
+                            # Skip parts[3] (empty)
+                            timestamp = parts[4].strip().strip('"')
+                            # Skip parts[5] (length)
+                            
+                            # Find the message content (next line after CMGL header)
+                            message_content = ""
+                            if i + 1 < len(lines):
+                                message_content = lines[i + 1].strip()
+                            
+                            sms_data = {
+                                'Id': sms_id,
+                                'Status': status,
+                                'Number': number,
+                                'Timestamp': timestamp,
+                                'Msg': message_content
+                            }
+                            sms_list.append(sms_data)
+                            self.logger.debug(f"📨 Parsed SMS: ID={sms_id}, Status={status}, Number={number}, Content='{message_content}'")
+                        except (ValueError, IndexError) as e:
+                            self.logger.warning(f"⚠️ Error parsing CMGL line: {line} - {e}")
+                            continue
+            
+            return sms_list
+        except Exception as e:
+            self.logger.error(f"❌ Error parsing CMGL response: {e}")
+            return []
+
     def _check_sms_count(self):
         """Check the number of SMS messages in the modem without reading them"""
         try:
@@ -183,24 +287,32 @@ class GSMSMS:
             
             self.logger.debug(f"📤 Executing AT command: SMS count check (AT+CPMS?)")
             
-            # Send CPMS command
-            self.gsm.writeData(b'AT+CPMS?\r\n')
+            # Use send_command instead of direct writeData for better reliability
+            # This ensures proper timeout handling and error recovery
+            result = self.gsm.commands.send_command("AT+CPMS?", "SMS count check", timeout=30)
             
-            # Wait for CPMS response with timeout
-            timeout = 10
-            if not self.gsm.waitForGsmIoCPMSReceived(timeout):
+            if not result:
                 self.logger.warning("⚠️ No CPMS response received - modem may be unresponsive")
+                self.logger.debug("🔍 CPMS timeout may indicate modem is busy or slow - will retry in next cycle")
                 return None
             
             if self.gsm.CPMSResponse:
-                # Parse +CPMS response: +CPMS: "ME",0,23,"ME",0,23,"ME",0,23
-                # Format: +CPMS: <mem1>,<used1>,<total1>,<mem2>,<used2>,<total2>,<mem3>,<used3>,<total3>
+                # Parse +CPMS response from AT+CPMS? command:
+                # Format: +CPMS: "SM",0,25,"SM",0,25,"SM",0,25
+                # Structure: <mem1>,<used1>,<total1>,<mem2>,<used2>,<total2>,<mem3>,<used3>,<total3>
+                # For SIM storage: mem1="SM", used1=messages in received box, total1=max capacity
                 try:
-                    # Extract the first "used" count (messages in SIM memory)
-                    parts = self.gsm.CPMSResponse.split(',')
+                    # Remove "+CPMS: " prefix and split by comma
+                    response_clean = self.gsm.CPMSResponse.replace('+CPMS:', '').strip()
+                    parts = response_clean.split(',')
+                    
+                    self.logger.debug(f"📊 CPMS response parsing: '{self.gsm.CPMSResponse}'")
+                    self.logger.debug(f"📊 CPMS parts: {parts}")
+                    
                     if len(parts) >= 2:
+                        # Get the second part (used count for received messages)
                         used_count = int(parts[1].strip())
-                        self.logger.debug(f"📊 SMS count: {used_count} messages in SIM memory")
+                        self.logger.debug(f"📊 SMS count: {used_count} messages in SIM memory (from parts[1]='{parts[1].strip()}')")
                         return used_count
                     else:
                         self.logger.warning("⚠️ Could not parse CPMS response")
@@ -221,117 +333,21 @@ class GSMSMS:
             return 0
     
     
-    def _read_single_sms(self, sms_id):
-        """Read a single SMS using AT+CMGR command"""
-        try:
-            self.logger.debug(f"📖 Reading SMS ID: {sms_id}")
-            
-            # Reset CMGR flags
-            self.gsm.GsmIoCMGRReceived = False
-            self.gsm.GsmIoCMGRData = ""
-            
-            # Send AT+CMGR command to read specific SMS
-            frame = bytes(self.gsm.commands.ATCMGR + str(sms_id), 'ascii')
-            self.gsm.writeData(frame + b'\r')
-            
-            # Wait for response with timeout
-            timeout = 10  # 10 seconds timeout for single SMS read
-            if not self.gsm.waitForGsmIoCMGRReceived(timeout):
-                self.logger.warning(f"⚠️ Timeout waiting for SMS read response for ID: {sms_id} - modem may be unresponsive")
-                return None
-            
-            # Parse CMGR response
-            cmgr_data = self.gsm.GsmIoCMGRData
-            if not cmgr_data:
-                self.logger.warning(f"⚠️ No CMGR data received for SMS ID: {sms_id}")
-                return None
-            
-            # Parse CMGR response format: +CMGR: "REC UNREAD","+1234567890",,"25/09/26,11:26:10+02"
-            # Followed by SMS content
-            lines = cmgr_data.split('\n')
-            if len(lines) < 2:
-                self.logger.warning(f"⚠️ Invalid CMGR response format for SMS ID: {sms_id}")
-                return None
-            
-            # Parse header line
-            header_line = lines[0].strip()
-            if not header_line.startswith('+CMGR:'):
-                self.logger.warning(f"⚠️ Invalid CMGR header for SMS ID: {sms_id}: {header_line}")
-                return None
-            
-            # Extract fields from header
-            # Format: +CMGR: "REC UNREAD","+1234567890",,"25/09/26,11:26:10+02"
-            header_content = header_line[7:].strip()  # Remove '+CMGR: '
-            fields = []
-            current_field = ""
-            in_quotes = False
-            
-            for char in header_content:
-                if char == '"':
-                    in_quotes = not in_quotes
-                elif char == ',' and not in_quotes:
-                    fields.append(current_field.strip('"'))
-                    current_field = ""
-                    continue
-                current_field += char
-            
-            if current_field:
-                fields.append(current_field.strip('"'))
-            
-            if len(fields) < 4:
-                self.logger.warning(f"⚠️ Insufficient fields in CMGR response for SMS ID: {sms_id}: {fields}")
-                return None
-            
-            self.logger.debug(f"📖 CMGR fields for SMS ID {sms_id}: {fields}")
-            
-            # Extract SMS content (everything after the header)
-            sms_content = '\n'.join(lines[1:]).strip()
-            
-            # Clean SMS content - remove PDU headers and trailing OK
-            if sms_content:
-                # Split by newlines and find the actual message content
-                content_lines = sms_content.split('\n')
-                message_lines = []
-                
-                for line in content_lines:
-                    line = line.strip()
-                    # Skip PDU header lines (contain commas and quotes)
-                    if ',' in line and '"' in line and not line.startswith('+'):
-                        continue
-                    # Skip standalone OK
-                    if line == 'OK':
-                        continue
-                    # This should be the actual message content
-                    if line:
-                        message_lines.append(line)
-                
-                # Join the message lines
-                clean_content = '\n'.join(message_lines).strip()
-                if clean_content:
-                    sms_content = clean_content
-            
-            # Create SMS data
-            sms_data = {
-                'Id': sms_id,
-                'Number': fields[1] if len(fields) > 1 else "",
-                'Status': fields[0] if len(fields) > 0 else "",
-                'Msg': sms_content
-            }
-            
-            self.logger.debug(f"📖 Successfully read SMS ID: {sms_id}, From: {sms_data['Number']}, Content: '{sms_content}'")
-            return sms_data
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error reading SMS ID {sms_id}: {e}")
-            return None
 
     def _delete_sms_without_semaphore(self, sms_id):
         """Delete SMS by ID without acquiring semaphore (assumes semaphore is already held)"""
         try:
             self.logger.debug(f"🗑️ Sending delete command for SMS ID: {sms_id}")
+            
+            # Reset OK flag before sending command
+            self.gsm.GsmIoOKReceived = False
+            if hasattr(self.gsm, 'gsm_io_main') and hasattr(self.gsm.gsm_io_main, 'io_thread'):
+                self.gsm.gsm_io_main.io_thread.ok_received = False
+            
             frame = bytes(self.gsm.commands.ATCMGD + str(sms_id) + ",0", 'ascii')
             # Use writeData directly instead of writeCommandAndWaitOK to avoid semaphore conflict
             self.gsm.writeData(frame + b'\r')
+            
             # Wait for OK response
             if not self.gsm.waitForGsmIoOKReceived(timeout=10):
                 raise Exception(f"Timeout waiting for OK response for SMS delete command")
@@ -348,6 +364,10 @@ class GSMSMS:
             frame = bytes(self.gsm.commands.ATCMGD + str(sms_id) + ",0", 'ascii')
             self.gsm.writeCommandAndWaitOK(frame)
             self.logger.debug(f"🗑️ Delete command completed for SMS ID: {sms_id}")
+            
+            # Add delay after SMS deletion to allow modem to update its internal state
+            time.sleep(1)
+            self.logger.debug(f"🗑️ Successfully deleted SMS ID: {sms_id}")
             
         except Exception as e:
             self.logger.error(f"❌ Error deleting SMS ID {sms_id}: {e}")

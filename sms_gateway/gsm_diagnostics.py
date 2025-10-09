@@ -68,38 +68,68 @@ class GSMDiagnostics:
         try:
             self.logger.info("🔄 Checking network status...")
             
-            # Get signal strength (skip if requested to avoid timeouts)
-            if skip_signal_check:
-                signal_strength = "unknown"
-                signal_percentage = 0
-                self.logger.debug("🔄 Skipping signal strength check to avoid timeouts")
+            # Check if we already have the semaphore (e.g., from startup operation)
+            if self.gsm.ModemOperationInProgress and self.gsm.ModemOperationType in ["startup", "status_check"]:
+                self.logger.debug("🔒 Using existing semaphore for network status check")
+                semaphore_acquired = True
             else:
-                signal_strength = self._getSignalStrength()
-                signal_percentage = self._getSignalPercentage(signal_strength)
+                # Acquire global modem semaphore for status check operation
+                semaphore_acquired = self.gsm.acquire_modem_semaphore("status_check", timeout=60)
             
-            # Get registration status
-            registration_status = self._getRegistrationStatus()
+            if not semaphore_acquired:
+                self.logger.warning("⚠️ Modem semaphore busy - skipping status check")
+                return {
+                    "signal_strength": "unknown",
+                    "signal_percentage": 0,
+                    "registration": "unknown", 
+                    "operator": "unknown",
+                    "sim_status": "unknown",
+                    "error": "modem_busy",
+                    "timestamp": time.time()
+                }
             
-            # Get operator info
-            operator_info = self._getOperatorInfo()
-            
-            # Get SIM status
-            sim_status = self._getSimStatus()
-            
-            network_info = {
-                "signal_strength": signal_strength,
-                "signal_percentage": signal_percentage,
-                "registration": registration_status,
-                "operator": operator_info,
-                "sim_status": sim_status,
-                "timestamp": time.time()
-            }
-            
-            self.logger.info(f"📊 Network Status: Signal={signal_strength} ({signal_percentage}%), Registration={registration_status}, Operator={operator_info}")
-            return network_info
+            try:
+                # Get signal strength (skip if requested to avoid timeouts)
+                if skip_signal_check:
+                    signal_strength = "unknown"
+                    signal_percentage = 0
+                    self.logger.debug("🔄 Skipping signal strength check to avoid timeouts")
+                else:
+                    signal_strength = self._getSignalStrength()
+                    signal_percentage = self._getSignalPercentage(signal_strength)
+                
+                # Get registration status
+                registration_status = self._getRegistrationStatus()
+                
+                # Get operator info
+                operator_info = self._getOperatorInfo()
+                
+                # Get SIM status
+                sim_status = self._getSimStatus()
+                
+                network_info = {
+                    "signal_strength": signal_strength,
+                    "signal_percentage": signal_percentage,
+                    "registration": registration_status,
+                    "operator": operator_info,
+                    "sim_status": sim_status,
+                    "timestamp": time.time()
+                }
+                
+                self.logger.info(f"📊 Network Status: Signal={signal_strength} ({signal_percentage}%), Registration={registration_status}, Operator={operator_info}")
+                return network_info
+                
+            finally:
+                # Only release semaphore if we acquired it ourselves
+                if semaphore_acquired and not (self.gsm.ModemOperationInProgress and self.gsm.ModemOperationType == "startup"):
+                    self.gsm.release_modem_semaphore("status_check")
             
         except Exception as e:
             self.logger.error(f"❌ Error checking network status: {e}")
+            # Check if it's a connection error and propagate it
+            if self.gsm.reset._is_connection_error(e):
+                self.logger.warning("🔄 Connection error in network status check - propagating to main thread")
+                raise e
             return {
                 "signal_strength": "unknown",
                 "signal_percentage": 0,
@@ -111,26 +141,23 @@ class GSMDiagnostics:
             }
     
     def getNetworkInfo(self):
-        """Get detailed network information (without signal check to avoid timeouts)"""
+        """Get device information only (no network status check to avoid conflicts)"""
         try:
-            self.logger.info("🔄 Getting detailed network information...")
+            self.logger.debug("🔄 Getting device information...")
             
-            network_info = self.checkNetworkStatus(skip_signal_check=True)
-            
-            # SMS storage is now set during initialization, no need to set it here
-            
-            # Add additional network details
-            network_info.update({
+            # Return only device info, don't check network status again
+            # This avoids conflicts with the main network status check
+            device_info = {
                 "device": self.gsm.GsmDevice,
                 "mode": self.gsm.GsmMode,
                 "ready": self.gsm.Ready,
                 "opened": self.gsm.Opened
-            })
+            }
             
-            return network_info
+            return device_info
             
         except Exception as e:
-            self.logger.error(f"❌ Error getting network info: {e}")
+            self.logger.error(f"❌ Error getting device info: {e}")
             return {"error": str(e), "timestamp": time.time()}
     
     def _getSignalStrength(self):
@@ -144,11 +171,41 @@ class GSMDiagnostics:
             # Use existing command mechanism with better error handling
             try:
                 # Try with shorter timeout and better error handling
-                self.gsm.commands.send_command("AT+CSQ", "Signal strength check", timeout=3)
-                # Parse signal strength from response
-                # +CSQ: 15,99 means RSSI=15 (good signal), BER=99 (not applicable)
-                # RSSI values: 0-31 (higher is better), 99 means unknown
-                return "good"  # Simplified for now
+                self.gsm.commands.send_command("AT+CSQ", "Signal strength check", timeout=10)
+                
+                # Wait for CSQ response using new I/O thread logic
+                if hasattr(self.gsm, 'gsm_io_main') and hasattr(self.gsm.gsm_io_main, 'io_thread'):
+                    # Use new I/O thread wait logic
+                    if self.gsm.gsm_io_main.wait_for_response("CSQ", timeout=10):
+                        # Parse signal strength from response
+                        # +CSQ: 15,99 means RSSI=15 (good signal), BER=99 (not applicable)
+                        # RSSI values: 0-31 (higher is better), 99 means unknown
+                        rssi_value = self._parseRSSIFromResponse()
+                        if rssi_value is not None:
+                            self.logger.debug(f"📶 RSSI value: {rssi_value}")
+                            # Convert RSSI to word description
+                            return self._rssiToWord(rssi_value)
+                        else:
+                            self.logger.debug("📶 Could not parse RSSI from response")
+                            return "unknown"
+                    else:
+                        self.logger.debug("📶 No CSQ response received")
+                        return "unknown"
+                else:
+                    # Fallback to old logic
+                    if self.gsm.waitForGsmIoCSQReceived(timeout=10):
+                        rssi_value = self._parseRSSIFromResponse()
+                        if rssi_value is not None:
+                            self.logger.debug(f"📶 RSSI value: {rssi_value}")
+                            # Convert RSSI to word description
+                            return self._rssiToWord(rssi_value)
+                        else:
+                            self.logger.debug("📶 Could not parse RSSI from response")
+                            return "unknown"
+                    else:
+                        self.logger.debug("📶 No CSQ response received")
+                        return "unknown"
+                    
             except Exception as e:
                 # Don't log every timeout as warning - reduce log spam
                 if "Timeout" in str(e):
@@ -163,11 +220,88 @@ class GSMDiagnostics:
             self.logger.warning(f"⚠️ Error getting signal strength: {e}")
             return "unknown"
     
+    def _parseRSSIFromResponse(self):
+        """Parse RSSI value from AT+CSQ response"""
+        try:
+            # Check both old and new CSQ response locations
+            response = None
+            
+            # Try new I/O thread location first
+            if hasattr(self.gsm, 'gsm_io_main') and hasattr(self.gsm.gsm_io_main, 'io_thread'):
+                if self.gsm.gsm_io_main.io_thread.csq_data:
+                    response = self.gsm.gsm_io_main.io_thread.csq_data
+                    self.logger.debug(f"📶 Using new CSQ data: {response}")
+            
+            # Fallback to old location
+            if not response and hasattr(self.gsm, 'CSQResponse') and self.gsm.CSQResponse:
+                response = self.gsm.CSQResponse
+                self.logger.debug(f"📶 Using old CSQ response: {response}")
+            
+            if response:
+                self.logger.debug(f"📶 Parsing RSSI from CSQ response: {response}")
+                
+                # Szukaj formatu +CSQ: rssi,ber
+                if '+CSQ:' in response:
+                    # Wyciągnij część po +CSQ:
+                    csq_part = response.split('+CSQ:')[1].strip()
+                    # Podziel po przecinku i weź pierwszą wartość (RSSI)
+                    rssi_str = csq_part.split(',')[0].strip()
+                    
+                    try:
+                        rssi_value = int(rssi_str)
+                        self.logger.debug(f"📶 Parsed RSSI: {rssi_value}")
+                        return rssi_value
+                    except ValueError:
+                        self.logger.warning(f"⚠️ Nie można sparsować RSSI: {rssi_str}")
+                        return None
+                else:
+                    self.logger.debug("📶 Brak +CSQ w odpowiedzi")
+                    return None
+            else:
+                self.logger.debug("📶 Brak odpowiedzi CSQ z modemu")
+                return None
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ Błąd parsowania RSSI: {e}")
+            return None
+
+    def _rssiToWord(self, rssi_value):
+        """Convert RSSI value to word description"""
+        if rssi_value == 99:
+            return "unknown"
+        elif rssi_value >= 20:
+            return "excellent"
+        elif rssi_value >= 15:
+            return "good"
+        elif rssi_value >= 10:
+            return "fair"
+        elif rssi_value >= 5:
+            return "poor"
+        else:
+            return "very poor"
+
     def _getSignalPercentage(self, signal_strength):
-        """Convert signal strength to percentage"""
+        """Convert signal strength to percentage based on RSSI value"""
         try:
             if signal_strength == "unknown":
                 return 0
+            
+            # Jeśli to liczba (RSSI), przelicz na procenty
+            if isinstance(signal_strength, int):
+                # RSSI: 0-31 (wyższe = lepsze), 99 = nieznane
+                if signal_strength == 99:
+                    return 0  # Nieznane
+                elif signal_strength >= 0 and signal_strength <= 31:
+                    # Przelicz RSSI (0-31) na procenty (0-100%)
+                    # Wzór: (RSSI / 31) * 100
+                    percentage = int((signal_strength / 31) * 100)
+                    self.logger.debug(f"📶 RSSI {signal_strength} = {percentage}%")
+                    return percentage
+                else:
+                    self.logger.warning(f"⚠️ Nieprawidłowa wartość RSSI: {signal_strength}")
+                    return 0
+            
+            # Zachowaj kompatybilność ze starymi wartościami tekstowymi
             elif signal_strength == "excellent":
                 return 100
             elif signal_strength == "good":
@@ -178,7 +312,8 @@ class GSMDiagnostics:
                 return 25
             else:
                 return 0
-        except:
+        except Exception as e:
+            self.logger.warning(f"⚠️ Błąd konwersji sygnału na procenty: {e}")
             return 0
     
     def _getOperatorInfo(self):
