@@ -21,8 +21,7 @@ class GsmIo:
         self.serial = GsmSerial(device)
         self.io_thread = GsmIoThread(self.serial)
         
-        # Command synchronization
-        self.semaphore = threading.Semaphore(1)  # Allow only one AT command at a time
+        # Command synchronization - now handled by global semaphore in gsm_core.py
         self.command_lock = None
         self.waiting_ok = False
         self.ready_to_send = True
@@ -36,7 +35,7 @@ class GsmIo:
         try:
             if self.serial.open_connection():
                 self.opened = True
-                self.io_thread.start()
+                # I/O thread will be started when semaphore is acquired
                 self.logger.info(f"GSM device opened: {self.device}")
                 return True
             else:
@@ -45,6 +44,30 @@ class GsmIo:
         except Exception as e:
             self.logger.error(f"Error opening GSM device: {e}")
             return False
+    
+    def start(self):
+        """Start I/O thread (for semaphore-based operation)"""
+        try:
+            if hasattr(self, 'io_thread') and self.io_thread:
+                if not self.io_thread.is_running:
+                    self.io_thread.start()
+                    self.logger.debug("I/O thread started")
+                else:
+                    self.logger.debug("I/O thread already running")
+        except Exception as e:
+            self.logger.error(f"Error starting I/O thread: {e}")
+    
+    def stop(self):
+        """Stop I/O thread (for error handling)"""
+        try:
+            if hasattr(self, 'io_thread') and self.io_thread:
+                if self.io_thread.is_running:
+                    self.io_thread.stop()
+                    self.logger.debug("I/O thread stopped")
+                else:
+                    self.logger.debug("I/O thread already stopped")
+        except Exception as e:
+            self.logger.error(f"Error stopping I/O thread: {e}")
     
     def close_device(self):
         """Close GSM device connection"""
@@ -63,10 +86,8 @@ class GsmIo:
             self.logger.error("Device not opened")
             return False
         
-        # Acquire semaphore to prevent AT command conflicts
-        if not self.semaphore.acquire(timeout=timeout):
-            self.logger.warning(f"⚠️ Timeout waiting for AT command semaphore for: {description}")
-            return False
+        # Note: Semaphore is now handled by global semaphore in gsm_core.py
+        # This method assumes the global semaphore is already acquired
         
         try:
             self.logger.debug(f"📤 Sending AT command: {description} ({command})")
@@ -79,7 +100,12 @@ class GsmIo:
             else:
                 command_str = str(command)
             
-            if not self.serial.write_data(command_str + '\r\n'):
+            # Log the exact command being sent
+            full_command = command_str + '\r\n'
+            self.logger.debug(f"📤 Command to modem: {repr(full_command)}")
+            self.logger.debug(f"📤 Command (hex): {full_command.encode('ascii').hex()}")
+            
+            if not self.serial.write_data(full_command):
                 return False
             
             # Wait for OK response
@@ -98,8 +124,8 @@ class GsmIo:
             self.logger.error(f"❌ Error sending AT command {description}: {e}")
             return False
         finally:
-            # Always release semaphore
-            self.semaphore.release()
+            # Note: Semaphore release is now handled by global semaphore in gsm_core.py
+            pass
     
     def write_data(self, data):
         """Write data to modem"""
@@ -115,6 +141,28 @@ class GsmIo:
             return False
         
         start_time = time.time()
+        
+        # Check if response is already available before resetting flags
+        response_already_available = False
+        if response_type == "OK" and self.io_thread.ok_received:
+            response_already_available = True
+        elif response_type == "CMSS" and self.io_thread.cmss_received:
+            response_already_available = True
+        elif response_type == "CPMS" and self.io_thread.cpms_received:
+            response_already_available = True
+        elif response_type == "CMGL" and self.io_thread.cmgl_received:
+            response_already_available = True
+        elif response_type == "CMGR" and self.io_thread.cmgr_received:
+            response_already_available = True
+        elif response_type == "CMTI" and self.io_thread.cmti_received:
+            response_already_available = True
+        elif response_type == "CSQ" and self.io_thread.csq_received:
+            response_already_available = True
+        
+        if response_already_available:
+            return True
+        
+        # Only reset flags if response is not already available
         self.io_thread.reset_flags()
         
         while time.time() - start_time < timeout:
@@ -129,6 +177,8 @@ class GsmIo:
             elif response_type == "CMGR" and self.io_thread.cmgr_received:
                 return True
             elif response_type == "CMTI" and self.io_thread.cmti_received:
+                return True
+            elif response_type == "CSQ" and self.io_thread.csq_received:
                 return True
             time.sleep(0.01)
         
@@ -146,6 +196,8 @@ class GsmIo:
             return self.io_thread.cmgl_data
         elif response_type == "CMGR":
             return self.io_thread.cmgr_data
+        elif response_type == "CSQ":
+            return self.io_thread.csq_data
         return ""
     
     def get_sms_list(self):

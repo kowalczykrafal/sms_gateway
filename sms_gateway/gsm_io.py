@@ -41,7 +41,9 @@ class gsm_io:
         self.GsmIoCMGLData = ""
         self.GsmIoCMTIReceived = False
         self.GsmIoCPMSReceived = False
+        self.GsmIoCSQReceived = False
         self.CPMSResponse = ""
+        self.CSQResponse = ""
         self.Opened = False
         
     def openGsmDevice(self):
@@ -77,6 +79,11 @@ class gsm_io:
     
     def writeData(self, data):
         """Write data (backward compatibility)"""
+        # Log data being written in DEBUG mode
+        self.logger.debug(f"📤 writeData called with: {data}")
+        if isinstance(data, bytes):
+            self.logger.debug(f"📤 writeData (hex): {data.hex()}")
+            self.logger.debug(f"📤 writeData (decoded): {data.decode('ascii', errors='ignore')}")
         return self.gsm_io_main.write_data(data)
     
     def waitForGsmIoCMSSReceived(self, timeout=10):
@@ -122,6 +129,13 @@ class gsm_io:
         """Wait for CMTI response (backward compatibility)"""
         result = self.gsm_io_main.wait_for_response("CMTI", timeout)
         self.GsmIoCMTIReceived = self.gsm_io_main.io_thread.cmti_received
+        return result
+    
+    def waitForGsmIoCSQReceived(self, timeout=10):
+        """Wait for CSQ response (backward compatibility)"""
+        result = self.gsm_io_main.wait_for_response("CSQ", timeout)
+        self.GsmIoCSQReceived = self.gsm_io_main.io_thread.csq_received
+        self.CSQResponse = self.gsm_io_main.io_thread.csq_data
         return result
     
     def startSmsTextRecording(self):
@@ -210,3 +224,11 @@ class gsm_io:
     @GsmIoCMTIReceived.setter
     def GsmIoCMTIReceived(self, value):
         self.gsm_io_main.io_thread.cmti_received = value
+    
+    @property
+    def GsmIoCSQReceived(self):
+        return self.gsm_io_main.io_thread.csq_received
+    
+    @GsmIoCSQReceived.setter
+    def GsmIoCSQReceived(self, value):
+        self.gsm_io_main.io_thread.csq_received = value

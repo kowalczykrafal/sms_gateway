@@ -30,6 +30,7 @@ class GSMReset:
                 'connection lost',
                 'serial port',
                 'i/o error',
+                'errno 5',
                 'broken pipe',
                 'connection reset',
                 'timeout'

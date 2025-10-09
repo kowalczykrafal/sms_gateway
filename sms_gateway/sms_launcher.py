@@ -92,9 +92,18 @@ def _initialize_gsm_gateway(loglevel, options, mqtt_client):
         
         # Send complete network status to MQTT (with full signal check on startup)
         try:
-            network_info = sms_gateway.checkNetworkStatus(skip_signal_check=False)
-            # Add device info for startup status
-            device_info = sms_gateway.getNetworkInfo()
+            # Acquire global modem semaphore for startup operation
+            if sms_gateway.acquire_modem_semaphore("startup", timeout=120):
+                try:
+                    network_info = sms_gateway.checkNetworkStatus(skip_signal_check=False)
+                    # Add device info for startup status
+                    device_info = sms_gateway.getNetworkInfo()
+                finally:
+                    sms_gateway.release_modem_semaphore("startup")
+            else:
+                logging.warning("⚠️ Could not acquire modem semaphore for startup status check")
+                network_info = {"signal_percentage": 0, "signal_strength": "unknown", "registration": "unknown", "operator": "unknown", "sim_status": "unknown"}
+                device_info = {"device": "unknown", "mode": "unknown"}
             status_data = {
                 "status": "ready",
                 "gsm": "ready",
@@ -166,10 +175,19 @@ def _run_main_loop(options):
             
             # Send periodic status every 3 minutes (with signal strength check)
             try:
-                # Get network info with signal strength check (only in this periodic loop)
-                network_info = sms_gateway.checkNetworkStatus(skip_signal_check=False)
-                # Add device info for periodic status
-                device_info = sms_gateway.getNetworkInfo()
+                # Acquire global modem semaphore for periodic status check
+                if sms_gateway.acquire_modem_semaphore("status_check", timeout=30):
+                    try:
+                        # Get network info with signal strength check (only in this periodic loop)
+                        network_info = sms_gateway.checkNetworkStatus(skip_signal_check=False)
+                        # Add device info for periodic status
+                        device_info = sms_gateway.getNetworkInfo()
+                    finally:
+                        sms_gateway.release_modem_semaphore("status_check")
+                else:
+                    logging.warning("⚠️ Could not acquire modem semaphore for periodic status check")
+                    network_info = {"signal_percentage": 0, "signal_strength": "unknown", "registration": "unknown", "operator": "unknown", "sim_status": "unknown"}
+                    device_info = {"device": "unknown", "mode": "unknown"}
                 status_data = {
                     "status": "ready",
                     "gsm": "ready",
